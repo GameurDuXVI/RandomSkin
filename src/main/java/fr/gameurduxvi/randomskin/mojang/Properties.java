@@ -7,4 +7,5 @@ public class Properties {
 
     String name;
     String value;
+    String signature;
 }

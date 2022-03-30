@@ -1,0 +1,11 @@
+# This is a TOML document.
+# Configuration for the application.
+
+# The SQL settings.
+[postgresql]
+host = "127.0.0.1"
+username = "luda"
+password = "astrid"
+database = "weeb"
+port = 1234
+enabled = "true"

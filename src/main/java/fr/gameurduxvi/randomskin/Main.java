@@ -1,5 +1,6 @@
 package fr.gameurduxvi.randomskin;
 
+import com.electronwill.nightconfig.core.file.FileConfig;
 import com.google.gson.Gson;
 import fr.gameurduxvi.randomskin.mcapi.ServerData;
 import fr.gameurduxvi.randomskin.mojang.Data;
@@ -10,21 +11,30 @@ import lombok.val;
 import javax.net.ssl.HttpsURLConnection;
 import java.io.*;
 import java.net.URL;
-import java.util.HashSet;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.Scanner;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 public class Main {
 
     public static void main(String[] args) {
+        // Register config file
+        FileConfig configFile = FileConfig.of("src/main/resources/config.toml");
+
+        // Load config file
+        configFile.load();
+
         // Define gson
         val gson = new Gson();
-        
+
         // Get servers list
         val servers = readFile("servers.txt");
-        
+
         // Send request to the mcapi to get online players
         val playerDatas = servers.stream()
                 .map(ip -> {
@@ -33,8 +43,7 @@ public class Main {
                 })
                 .flatMap(sd -> sd.getPlayers().getSample().stream())
                 .filter(pd -> !pd.getId().startsWith("00000000")
-                        && !pd.getName().contains("§"))
-                .collect(Collectors.toList());
+                        && !pd.getName().contains("§")).toList();
 
 
         // Add & count the new player data's
@@ -49,19 +58,50 @@ public class Main {
         System.out.println(newPlayerDatas.get() + " new players registered");
 
         // Send request to mojang to get the skin values
-        val skins = new HashSet<String>();
+        val skins = new HashMap<String, String>();
         val allPlayerDatas = Main.readFile("playerdatas.txt");
         allPlayerDatas.forEach(pd -> {
             val uuid = pd.split("\\|")[0];
             System.out.println("Get skin of " + uuid + " (" + (allPlayerDatas.indexOf(pd) + 1) + "/" + allPlayerDatas.size() + ")");
-            //System.out.println(Generators.timeBasedGenerator().generate().toString());
             try {
-                val content = getContent("https://sessionserver.mojang.com/session/minecraft/profile/" + uuid);
-                skins.add(gson.fromJson(content, Data.class).getProperties().get(0).getValue());
+                val content = getContent("https://sessionserver.mojang.com/session/minecraft/profile/" + uuid + "?unsigned=false");
+                skins.put(gson.fromJson(content, Data.class).getProperties().get(0).getValue(), gson.fromJson(content, Data.class).getProperties().get(0).getSignature());
             } catch (Exception ignored) {
             }
         });
 
+
+        // Add the skin to the postgresql database
+        if (configFile.get("postgresql.enabled").equals("true")) {
+            try (Connection connection = DriverManager.getConnection("jdbc:postgresql://" +
+                    configFile.get("postgresql.host") + ":" +
+                    configFile.get("postgresql.port") + "/" +
+                    configFile.get("postgresql.database") + "?user=" +
+                    configFile.get("postgresql.username") + "&password=" +
+                    configFile.get("postgresql.password"))) {
+                val select = connection.prepareStatement("SELECT * FROM skins WHERE value = ?");
+                val insert = connection.prepareStatement("INSERT INTO skins (value, signature) VALUES (?, ?)");
+                skins.forEach((value, signature) -> {
+                    try {
+                        select.setString(1, value);
+                        ResultSet resultSet = select.executeQuery();
+                        if (!resultSet.next()) {
+                            insert.setString(1, value);
+                            insert.setString(2, signature);
+                            insert.executeUpdate();
+                            System.out.println("Added skin in database");
+                        }
+                    } catch (SQLException e) {
+                        e.printStackTrace();
+                    }
+                });
+            } catch (SQLException ex) {
+                ex.printStackTrace();
+            }
+        }
+    }
+
+        /*
         // Add & count the new skins
         val newSkins = new AtomicInteger();
         val oldSkins = Main.readFile("skins.txt");
@@ -72,7 +112,7 @@ public class Main {
                     appendToFile("skins.txt", value);
                 });
         System.out.println(newSkins.get() + " new skins registered");
-    }
+         */
 
     @SneakyThrows
     public static String getContent(@NonNull String link) {
@@ -90,7 +130,7 @@ public class Main {
     @SneakyThrows
     public static LinkedList<String> readFile(String fileName) {
         val file = new File(fileName);
-        if(!file.exists())
+        if (!file.exists())
             file.createNewFile();
         val reader = new Scanner(file);
         val list = new LinkedList<String>();
