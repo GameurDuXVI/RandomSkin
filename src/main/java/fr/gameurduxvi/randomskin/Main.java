@@ -2,6 +2,8 @@ package fr.gameurduxvi.randomskin;
 
 import com.electronwill.nightconfig.core.file.FileConfig;
 import com.google.gson.Gson;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import fr.gameurduxvi.randomskin.mcapi.ServerData;
 import fr.gameurduxvi.randomskin.mojang.Data;
 import lombok.NonNull;
@@ -11,18 +13,19 @@ import lombok.val;
 import javax.net.ssl.HttpsURLConnection;
 import java.io.*;
 import java.net.URL;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.Scanner;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 public class Main {
 
-    public static void main(String[] args) {
+    private static final boolean ASK_SKIN_ONLY_FOR_NEW_PLAYERS = true;
+
+    public static void main(String[] args) throws SQLException {
         // Register config file
         FileConfig configFile = FileConfig.of("src/main/resources/config.toml");
 
@@ -34,35 +37,43 @@ public class Main {
 
         // Get servers list
         val servers = readFile("servers.txt");
+        val actualServer = new AtomicInteger();
 
         // Send request to the mcapi to get online players
-        val playerDatas = servers.stream()
+        val playerDatas = servers.parallelStream()
                 .map(ip -> {
-                    System.out.println("Pinging " + ip + " (" + (servers.indexOf(ip) + 1) + "/" + servers.size() + ")");
+                    System.out.println("Pinging " + ip + " (" + actualServer.incrementAndGet() + "/" + servers.size() + ")");
                     return gson.fromJson(getContent("https://mcapi.us/server/status?ip=" + ip), ServerData.class);
                 })
                 .flatMap(sd -> sd.getPlayers().getSample().stream())
                 .filter(pd -> !pd.getId().startsWith("00000000")
-                        && !pd.getName().contains("§")).toList();
+                        && !pd.getName().contains("§"))
+                .toList();
 
 
-        // Add & count the new player data's
-        val newPlayerDatas = new AtomicInteger();
-        val oldPlayerDatas = readFile("playerdatas.txt");
-        playerDatas.stream()
-                .filter(pd -> !oldPlayerDatas.contains(pd.getId() + "|" + pd.getName()))
-                .forEach(pd -> {
-                    newPlayerDatas.set(newPlayerDatas.get() + 1);
-                    appendToFile("playerdatas.txt", pd.getId() + "|" + pd.getName());
-                });
-        System.out.println(newPlayerDatas.get() + " new players registered");
+        // Get old player data
+        val allPlayerDatas = readFile("playerdatas.txt");
+
+        // Map new data to string
+        val newPlayerDatas = playerDatas.stream()
+                .filter(pd -> !allPlayerDatas.contains(pd.getId() + "|" + pd.getName()))
+                .map(pd -> pd.getId() + "|" + pd.getName())
+                .collect(Collectors.toList());
+
+        // Add new player data to file & list
+        newPlayerDatas.forEach(line -> {
+            allPlayerDatas.add(line);
+            appendToFile("playerdatas.txt", line);
+        });
+
+        System.out.println(newPlayerDatas.size() + " new players registered");
 
         // Send request to mojang to get the skin values
         val skins = new HashMap<String, String>();
-        val allPlayerDatas = Main.readFile("playerdatas.txt");
-        allPlayerDatas.forEach(pd -> {
+        val playerDatasToAsk = ASK_SKIN_ONLY_FOR_NEW_PLAYERS ? newPlayerDatas : allPlayerDatas;
+        playerDatasToAsk.forEach(pd -> {
             val uuid = pd.split("\\|")[0];
-            System.out.println("Get skin of " + uuid + " (" + (allPlayerDatas.indexOf(pd) + 1) + "/" + allPlayerDatas.size() + ")");
+            System.out.println("Get skin of " + uuid + " (" + (playerDatasToAsk.indexOf(pd) + 1) + "/" + playerDatasToAsk.size() + ")");
             try {
                 val content = getContent("https://sessionserver.mojang.com/session/minecraft/profile/" + uuid + "?unsigned=false");
                 skins.put(gson.fromJson(content, Data.class).getProperties().get(0).getValue(), gson.fromJson(content, Data.class).getProperties().get(0).getSignature());
@@ -73,31 +84,37 @@ public class Main {
 
         // Add the skin to the postgresql database
         if (configFile.get("postgresql.enabled").equals("true")) {
-            try (Connection connection = DriverManager.getConnection("jdbc:postgresql://" +
+            val config = new HikariConfig();
+
+            config.setJdbcUrl("jdbc:postgresql://" +
                     configFile.get("postgresql.host") + ":" +
                     configFile.get("postgresql.port") + "/" +
-                    configFile.get("postgresql.database") + "?user=" +
-                    configFile.get("postgresql.username") + "&password=" +
-                    configFile.get("postgresql.password"))) {
-                val select = connection.prepareStatement("SELECT * FROM skins WHERE value = ?");
-                val insert = connection.prepareStatement("INSERT INTO skins (value, signature) VALUES (?, ?)");
-                skins.forEach((value, signature) -> {
-                    try {
-                        select.setString(1, value);
-                        ResultSet resultSet = select.executeQuery();
-                        if (!resultSet.next()) {
-                            insert.setString(1, value);
-                            insert.setString(2, signature);
-                            insert.executeUpdate();
-                            System.out.println("Added skin in database");
-                        }
-                    } catch (SQLException e) {
-                        e.printStackTrace();
-                    }
-                });
-            } catch (SQLException ex) {
-                ex.printStackTrace();
-            }
+                    configFile.get("postgresql.database"));
+            config.setUsername(configFile.get("postgresql.username"));
+            config.setPassword(configFile.get("postgresql.password"));
+
+            val source = new HikariDataSource(config);
+
+            val stmt = source.getConnection().prepareStatement("INSERT INTO skins (value, signature) SELECT ?, ? WHERE NOT EXISTS(SELECT * FROM skins where SUBSTRING(value, 43, LENGTH(value))=SUBSTRING(?, 43, LENGTH(?)))");
+            skins.forEach((value, signature) -> {
+                try {
+                    stmt.setString(1, value);
+                    stmt.setString(2, signature);
+                    stmt.setString(3, value);
+                    stmt.setString(4, value);
+                    stmt.addBatch();
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                }
+            });
+            val updated = stmt.executeBatch();
+
+            val amountNewSkins = new AtomicInteger();
+            Arrays.stream(updated).forEach(i -> amountNewSkins.set(amountNewSkins.get() + i));
+
+            System.out.println(amountNewSkins.get() + " new skins added");
+
+            source.close();
         }
     }
 
