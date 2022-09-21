@@ -118,19 +118,6 @@ public class Main {
         }
     }
 
-        /*
-        // Add & count the new skins
-        val newSkins = new AtomicInteger();
-        val oldSkins = Main.readFile("skins.txt");
-        skins.stream()
-                .filter(value -> oldSkins.stream().noneMatch(oldValue -> oldValue.substring(42, oldValue.length()).equals(value.substring(42, value.length()))))
-                .forEach(value -> {
-                    newSkins.set(newSkins.get() + 1);
-                    appendToFile("skins.txt", value);
-                });
-        System.out.println(newSkins.get() + " new skins registered");
-         */
-
     @SneakyThrows
     public static String getContent(@NonNull String link) {
         val url = new URL(link);
